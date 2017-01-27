@@ -34,6 +34,7 @@ from ansible.release import __version__, __author__
 from ansible import constants as C
 from ansible.errors import AnsibleError
 from ansible.module_utils._text import to_bytes, to_text
+from ansible.plugins import module_utils_loader
 # Must import strategy and use write_locks from there
 # If we import write_locks directly then we end up binding a
 # variable to the object and then it never gets updated.
@@ -468,13 +469,16 @@ def recursive_finder(name, data, py_module_names, py_module_cache, zf):
     # Loop through the imports that we've found to normalize them
     # Exclude paths that match with paths we've already processed
     # (Have to exclude them a second time once the paths are processed)
+
+    snippet_paths = [p for p in module_utils_loader._get_paths(subdirs=False) if os.path.isdir(p)]
+    snippet_paths.append(_SNIPPET_PATH)
     for py_module_name in finder.submodules.difference(py_module_names):
         module_info = None
 
         if py_module_name[0] == 'six':
             # Special case the python six library because it messes up the
             # import process in an incompatible way
-            module_info = imp.find_module('six', [_SNIPPET_PATH])
+            module_info = imp.find_module('six', snippet_paths)
             py_module_name = ('six',)
             idx = 0
         else:
@@ -485,7 +489,7 @@ def recursive_finder(name, data, py_module_names, py_module_cache, zf):
                     break
                 try:
                     module_info = imp.find_module(py_module_name[-idx],
-                            [os.path.join(_SNIPPET_PATH, *py_module_name[:-idx])])
+                            [os.path.join(p, *py_module_name[:-idx]) for p in snippet_paths])
                     break
                 except ImportError:
                     continue
@@ -513,7 +517,7 @@ def recursive_finder(name, data, py_module_names, py_module_cache, zf):
                 if module_info[2][2] == imp.PKG_DIRECTORY:
                     # Read the __init__.py instead of the module file as this is
                     # a python package
-                    py_module_cache[py_module_name + ('__init__',)] = _slurp(os.path.join(os.path.join(_SNIPPET_PATH, *py_module_name), '__init__.py'))
+                    py_module_cache[py_module_name + ('__init__',)] = _slurp(os.path.join(os.path.join(module_info[1], '__init__.py')))
                     normalized_modules.add(py_module_name + ('__init__',))
                 else:
                     py_module_cache[py_module_name] = module_info[0].read()
@@ -525,8 +529,10 @@ def recursive_finder(name, data, py_module_names, py_module_cache, zf):
             for i in range(1, len(py_module_name)):
                 py_pkg_name = py_module_name[:-i] + ('__init__',)
                 if py_pkg_name not in py_module_names:
+                    pkg_dir_info = imp.find_module(py_pkg_name[-1],
+                            [os.path.join(p, *py_pkg_name[:-1]) for p in snippet_paths])
                     normalized_modules.add(py_pkg_name)
-                    py_module_cache[py_pkg_name] = _slurp('%s.py' % os.path.join(_SNIPPET_PATH, *py_pkg_name))
+                    py_module_cache[py_pkg_name] = _slurp(pkg_dir_info[1])
 
     #
     # iterate through all of the ansible.module_utils* imports that we haven't
@@ -719,6 +725,7 @@ def _find_snippet_imports(module_name, module_data, module_path, module_args, ta
         lines = module_data.split(b'\n')
         for line in lines:
             if REPLACER_WINDOWS in line:
+                # Need to make a module_utils loader for powershell at some point
                 ps_data = _slurp(os.path.join(_SNIPPET_PATH, "powershell.ps1"))
                 output.write(ps_data)
                 py_module_names.add((b'powershell',))
