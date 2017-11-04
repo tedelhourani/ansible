@@ -25,12 +25,15 @@ options:
     required: true
   mode:
     description:
-     - The name of the tenant to which this segment belongs.
+     - The mode of the interface group, e.g. lacp.
      default: static
      choices: ['cdp', 'inter-pod', 'lacp', 'lldp', 'span-fabric', 'static']
+  members:
+    description:
+    - The leaf switch, host-based, or chassis-mac members of this interface group.
   state:
     description:
-     - Whether the segment should be present or absent.
+     - Whether the interface group should be present or absent.
     default: present
     choices: ['present', 'absent']
   controller:
@@ -51,22 +54,49 @@ options:
 
 
 EXAMPLES = '''
-- name: bcf interface group
+- name: interface group
       bcf_interface_group:
-        name: R1H1
-        members:
+        name: R1H2
+        members: {'switch': {'Rack1Leaf1': ['ethernet5', 'ethernet6'],
+                             'Rack1Leaf2': ['ethernet5', 'ethernet6']}}
+        controller: '{{ inventory_hostname }}'
+        state: present
+
+- name: chassis interface group
+      bcf_interface_group:
+        name: chassis
+        mode: lldp
+        members: {'chassis-mac': ['13:13:08:6C:21:F4']}
+        controller: '{{ inventory_hostname }}'
+        state: present
+
+- name: host interface group
+      bcf_interface_group:
+        name: esx-server2
+        mode: lldp
+        members: {'host': {'esx-server2.prod.corporate.com': ['vmnic2', 'vmnic3']}}
         controller: '{{ inventory_hostname }}'
         state: present
 '''
 
 
-RETURN = '''
-'''
+RETURN = ''' # '''
 
 import os
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.bigswitch_utils import Rest, Response
 from ansible.module_utils.pycompat24 import get_exception
+
+def path(name, member_type, member):
+    if member_type == 'member-interface':
+        return 'interface-group[name="%s"]/member-interface[switch-name="%s"][interface-name="%s"]' \
+            % (name, member['switch-name'], member['interface-name'])
+    if member_type == 'host-interface':
+        return 'interface-group[name="%s"]/host-interface[host-name="%s"][interface-name="%s"]' \
+            % (name, member['host-name'], member['interface-name'])
+    if member_type == 'chassis-mac':
+        return 'interface-group[name="%s"]/chassis-mac[mac-address="%s"]' \
+            % (name, member['mac-address'])
 
 def interface_group(module):
     try:
@@ -81,6 +111,7 @@ def interface_group(module):
     state = module.params['state']
     controller = module.params['controller']
 
+    #module.exit_json(msg=members, changed=False)
 
     rest = Rest(module,
                 {'Content-type': 'application/json',
@@ -102,43 +133,32 @@ def interface_group(module):
         module.exit_json(changed=False)
 
     if state in ('present'):
-        response = rest.get('interface-group[name="%s"]' % name, data={})
-        if not response.status_code != 204:
-            module.fail_json(msg="failed to lookup interface group in existing config {}: {}".format(response.json))
-
         changed = False
-        current_members = []
+        current_members = {}
         current_mode = None
+
         if not config_present:
+            current_members['member-interface'] = []
+            current_members['host-interface'] = []
+            current_members['chassis-mac'] = []
             response = rest.put('interface-group[name="%s"]' % name, data={'name': name})
             changed = True
             if response.status_code != 204:
                 module.fail_json(msg="error creating interface group '{}': {}".format(name, response.info))
         else:
+            response = rest.get('interface-group[name="%s"]' % name, data={})
+            if not response.status_code != 204:
+                module.fail_json(msg="failed to lookup interface group in existing config {}: {}".format(response.json))
+            #module.exit_json(msg=response.json[0], changed=False)
             if 'member-interface' in response.json[0]:
-                current_members = [{member['switch-name']:member['interface-name']}
-                                   for member in response.json[0]['member-interface']]
+                current_members['member-interface'] =  response.json[0]['member-interface']
+            if 'host-interface' in response.json[0]:
+                current_members['host-interface'] = response.json[0]['host-interface']
+            if 'chassis-mac' in response.json[0]:
+                current_members['chassis-mac'] = response.json[0]['chassis-mac']
             current_mode = response.json[0]['mode']
 
-
-        # update members
-        for member in current_members:
-            if not member in members:
-                changed = True
-                (switch, interface) = member.items()[0]
-                response = rest.delete('interface-group[name="%s"]/member-interface[switch-name="%s"][interface-name="%s"]' % (name, switch, interface), data={})
-                if response.status_code != 204:
-                    module.fail_json(msg="error deleting interface group member '{}': {}".format(name, response.info))
-            else:
-                members.remove(member)
-
-        for member in members:
-            changed = True
-            (switch, interface), = member.items()
-            data = {'switch-name': switch, "interface-name": interface}
-            response = rest.put('interface-group[name="%s"]/member-interface[switch-name="%s"][interface-name="%s"]' % (name, switch, interface), data=data)
-            if response.status_code != 204:
-                module.fail_json(msg="error adding interface group member '{}': {}".format(name, response.info))
+        #module.exit_json(msg=current_members, changed=False)
 
         # update mode
         if not current_mode == mode:
@@ -146,6 +166,52 @@ def interface_group(module):
             response = rest.patch('interface-group[name="%s"]' % name, data={'mode': mode})
             if response.status_code != 204:
                 module.fail_json(msg="error creating segment '{}': {}".format(name, response.info))
+
+        target_members = {}
+        for member_type in members:
+            if member_type == 'switch':
+                switch_members = members['switch']
+                target_members['member-interface'] = []
+                for switch in switch_members:
+                    target_members['member-interface'].extend([{'switch-name':switch, 'interface-name':interface}
+                                                               for interface in switch_members[switch] ])
+            if member_type == 'host':
+                host_members = members['host']
+                target_members['host-interface'] = []
+                for host in host_members:
+                    target_members['host-interface'] = [ {'host-name':host, 'interface-name':interface}
+                                                         for interface in host_members[host] ]
+            if member_type == 'chassis-mac':
+                target_members['chassis-mac'] = []
+                target_members['chassis-mac'] = [ {'mac-address':mac} for mac in members['chassis-mac']]
+
+        obsolete_members = {}
+        new_members = {}
+        for member_type in target_members:
+            obsolete_members[member_type] = [member for member in current_members.get(member_type, [])
+                                             if not member in target_members.get(member_type,[])]
+            new_members[member_type] = [member for member in target_members.get(member_type, [])
+                                        if not member in current_members.get(member_type, [])]
+
+        #module.exit_json(msg={'current':current_members,'target':target_members}, changed=False)
+        #module.exit_json(msg={'obsolete':obsolete_members,'new':new_members}, changed=False)
+
+        # update members
+        for member_type in obsolete_members:
+            for member in obsolete_members[member_type]:
+                #path(name, member_type, member)
+                response = rest.delete(path(name, member_type, member), data={})
+                if response.status_code != 204:
+                    module.fail_json(msg="error deleting interface group member '{}': {}".format(name, response.info))
+
+        for member_type in new_members:
+            for member in new_members[member_type]:
+                response = rest.put(path(name, member_type, member), data=member)
+                if response.status_code != 204:
+                    module.fail_json(msg="error adding interface group member '{}': {}".format(name, response.info))
+
+        if [member_type for member_type in target_members if obsolete_members[member_type] or new_members[member_type]]:
+            changed = True
 
         module.exit_json(changed=changed)
 
@@ -161,7 +227,7 @@ def main():
         argument_spec=dict(
             name=dict(type='str', required=True),
             mode=dict(choices=['cdp', 'inter-pod', 'lacp', 'lldp', 'span-fabric', 'static'], default='static'),
-            members=dict(type='list', default=[]),
+            members=dict(type='dict', default={}),
             controller=dict(type='str', required=True),
             state=dict(choices=['present', 'absent'], default='present'),
             validate_certs=dict(type='bool', default='False'),  # TO DO: change this to default='True'
