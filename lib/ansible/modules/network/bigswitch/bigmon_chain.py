@@ -27,6 +27,15 @@ options:
     description:
      - The name of the chain.
     required: true
+  switch:
+    description:
+     - The mac address of the switch
+  endpoint1:
+    description:
+     - The first endpoint of the chain
+  endpoint2:
+    description:
+     - The second endpoint of the chain
   state:
     description:
      - Whether the service chain should be present or absent.
@@ -53,6 +62,8 @@ EXAMPLES = '''
 - name: bigmon inline service chain
   bigmon_chain:
     name: MyChain
+    endpoint1: ethernet1
+    endpoint2: ethernet2
     controller: '{{ inventory_hostname }}'
     state: present
     validate_certs: false
@@ -77,6 +88,9 @@ def chain(module):
 
     name = module.params['name']
     state = module.params['state']
+    switch = module.params['switch']
+    endpoint1 = module.params['endpoint1']
+    endpoint2 = module.params['endpoint2']
     controller = module.params['controller']
 
     rest = Rest(module,
@@ -92,8 +106,14 @@ def chain(module):
 
     config_present = False
     matching = [chain for chain in response.json if chain['name'] == name]
+    target_chain = {'endpoint1': endpoint1,
+                    'endpoint2': endpoint2,
+                    'switch': '00:00:'+switch}
     if matching:
-        config_present = True
+        matching_chain = matching[0]
+        if not cmp(target_chain,
+                   matching_chain['endpoint-pair']):
+            config_present = True
 
     if state in ('present') and config_present:
         module.exit_json(changed=False)
@@ -103,6 +123,14 @@ def chain(module):
 
     if state in ('present'):
         response = rest.put('chain[name="%s"]' % name, data={'name': name})
+        if response.status_code != 204:
+            module.fail_json(msg="error creating chain '{}': {}".format(name, response.json['description']))
+
+        #PATCH http://127.0.0.1:8082/api/v1/data/controller/applications/bigchain/chain[name="customer1"]/endpoint-pair {"endpoint1": "ethernet1", "switch": "00:00:00:00:00:00:00:0a", "endpoint2": "ethernet2"}
+        data = target_chain
+        path = 'chain[name="%s"]/endpoint-pair' % name
+        response = rest.patch(path, data=data)
+
         if response.status_code == 204:
             module.exit_json(changed=True)
         else:
@@ -119,6 +147,9 @@ def main():
     module = AnsibleModule(
         argument_spec=dict(
             name=dict(type='str', required=True),
+            switch=dict(type='str', required=True),
+            endpoint1=dict(type='str', required=True),
+            endpoint2=dict(type='str', required=True),
             controller=dict(type='str', required=True),
             state=dict(choices=['present', 'absent'], default='present'),
             validate_certs=dict(type='bool', default='True'),
